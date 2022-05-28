@@ -1,0 +1,222 @@
+---
+title: "hw_6"
+author: "Sabrina Lem"
+date: "5/16/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidymodels)
+library(tidyverse)
+library(glmnet)
+library(ggplot2)
+library(rpart.plot)
+library(vip)
+library(janitor)
+library(xgboost)
+library(ranger)
+library(pdp)
+library(randomForest)
+tidymodels_prefer()
+
+data <-read_csv('Pokemon.csv')
+```
+
+
+Exercise 1:
+```{r}
+# clean data
+pokemon <- janitor::clean_names(data)
+#pokemon <- pokemon_clean %>% filter(type_1 == "Bug"|type_1 == "Fire"|
+                                      #type_1 == "Grass"|type_1 == "Normal"|
+                                      #type_1 == "Water"|type_1 == "Psychic")
+pokemon <- pokemon[pokemon$type_1 %in% c("Bug", "Fire", "Grass", "Normal", "Water", "Psychic"),]
+pokemon$type_1 <- as.factor(pokemon$type_1)
+pokemon$legendary <- as.factor(pokemon$legendary)
+#split 
+set.seed(1027)
+pokemon_split <- initial_split(pokemon, prop= 0.8, strata = "type_1")
+
+pokemon_train <- training(pokemon_split)
+pokemon_test <- testing(pokemon_split)
+# folds
+pokemon_folds <- vfold_cv(pokemon_train, strata = "type_1", v = 5)
+# recipe
+pokemon_recipe <- recipe(type_1 ~ legendary + generation + sp_atk + 
+                           attack + speed + defense + 
+                           hp + sp_def, pokemon_train) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors()) 
+```
+Exercise 2:
+```{r}
+library(corrplot)
+pokemon %>%
+  select(is.numeric) %>%
+  cor() %>%
+  corrplot(type="lower", diag= FALSE, method = 'color')
+```
+Total is strongly positively correlated with all other variables. In general most variables are positively correlated with each other. These relationships makes sense because a Pokemon with a higher level of defense or attack will most likely have a higher level of speed or defense. In other words a better quality Pokemon will have overall relatively higher levels to their characteristics.   
+
+Exercise 3:
+```{r}
+tree_spec <- decision_tree() %>%
+  set_engine("rpart")
+class_tree_spec <- tree_spec %>%
+  set_mode("classification")
+class_tree_wf <- workflow() %>%
+  add_model(class_tree_spec %>% set_args(cost_complexity = tune())) %>%
+  add_recipe(pokemon_recipe)
+
+param_grid <- grid_regular(cost_complexity(range = c(-3, -1)), levels = 10)
+
+tune_res <- tune_grid(
+  class_tree_wf, 
+  resamples = pokemon_folds, 
+  grid = param_grid, 
+  metrics = metric_set(roc_auc)
+)
+autoplot(tune_res)
+```
+After .008 the curve takes a downward trend in roc-auc value. The curve continues hyperbolically fall as cost-complexity increases. A single decision tree  has a better performance with a lower cost-complexity parameter. 
+Exercise 4: 
+```{r}
+best_compl <- select_best(tune_res)
+best_compl
+
+arrange(collect_metrics(tune_res), cost_complexity)
+```
+The ROC-AUC of the best performing pruned decision tree is 0.6744568.
+\
+\
+Exercise 5:
+```{r}
+class_tree_final <- finalize_workflow(class_tree_wf, best_compl)
+class_tree_final_fit <- fit(class_tree_final, data = pokemon_train)
+
+class_tree_final_fit %>%
+  extract_fit_engine() %>%
+  rpart.plot(roundint = FALSE)
+```
+Exercise 5b:
+```{r}
+class_for_spec <- rand_forest() %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification") 
+class_for_wf <- workflow() %>%
+  add_model(class_for_spec %>% 
+              set_args(mtry = tune(), trees = tune(),min_n = tune())) %>%
+  add_recipe(pokemon_recipe)  
+
+
+param_grid_for <- grid_regular(mtry(range = c(1,8)), trees(range= c(1,5)),
+                               min_n(range = c(3,10)), levels = 8)
+
+```
+
+mtry is number of variables to possibly split at in each node.\
+trees is number of trees in the model.\
+min_n is the minimal node size.\
+\
+mtry should be between 1 and 8 because there are only 8 predictor variables in our recipe. mtry 8 would be a model that uses all 8 of our predictor variables.
+\
+\
+Exercise 6:
+```{r}
+tune_res_for <- tune_grid(
+  class_for_wf, 
+  resamples = pokemon_folds, 
+  grid = param_grid_for,
+  metrics = metric_set(roc_auc))
+
+autoplot(tune_res_for)
+```
+Exercise 7:
+```{r}
+best_for <- select_best(tune_res_for)
+best_for
+
+arrange(collect_metrics(tune_res_for), mtry, trees, min_n)
+```
+The ROC AUC is 0.7073355 
+\
+\
+Exercise 8: 
+```{r}
+
+class_for_final <- finalize_workflow(class_for_wf, best_for)
+class_for_final_fit <- fit(class_for_final, data = pokemon_train)
+class_for_final_fit%>%
+  extract_fit_parsnip()%>%
+  vip()
+```
+sp_attack and hp were the most useful, while generation and legendary were the least useful. Yes, I assume that you need to have successful sp_attack and hp make for the 'best' Pokemon.
+\
+\
+Exercise 9: 
+```{r}
+boost_spec <- boost_tree() %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+boost_wf <- workflow() %>% 
+  add_model(boost_spec %>% 
+              set_args(trees = tune())) %>%
+  add_recipe(pokemon_recipe) 
+param_grid_boost <- grid_regular(trees(range = c(10,2000)), levels = 10)
+
+tune_res_boost <- tune_grid(
+  boost_wf, 
+  resamples = pokemon_folds, 
+  grid = param_grid_boost,
+  metrics = metric_set(roc_auc))
+
+autoplot(tune_res_boost)
+
+best_boost <- select_best(tune_res_boost)
+best_boost
+
+arrange(collect_metrics(tune_res_boost),trees)
+```
+The ROC-AUC of the best model is 	0.7327269
+
+```{r}
+compl <- collect_metrics(tune_res)
+roc_compl <- subset(compl, .config=='Preprocessor1_Model08')[,4]
+roc_compl$type <- c('pruned tree')
+
+forest <- collect_metrics(tune_res_for)
+roc_forest <- subset(forest, .config =='Preprocessor1_Model118')[,6]
+roc_forest$type <- c('random forest')
+
+
+boost <- collect_metrics(tune_res_boost)
+roc_boost <-subset(boost, .config == 'Preprocessor1_Model01')[,4]
+roc_boost$type <- c('boosted tree')
+
+
+x<-rbind(roc_compl, roc_forest, roc_boost )
+table <-  x[,c(2,1)] %>% rename(roc_auc = mean)
+table
+
+best_final <- select_best(tune_res_boost)
+final_wf <- finalize_workflow(boost_wf, best_final)
+final_fit <- fit(final_wf, data = pokemon_train)
+
+augm <- augment(final_fit, new_data = pokemon_test) 
+augm %>% roc_auc(truth = type_1, estimate =c(
+  .pred_Bug, .pred_Fire, .pred_Grass, .pred_Normal,
+  .pred_Psychic, .pred_Water))
+
+augm %>% roc_curve(truth = type_1, estimate =c(
+  .pred_Bug, .pred_Fire, .pred_Grass, .pred_Normal,
+  .pred_Psychic, .pred_Water)) %>%
+  autoplot()
+
+augm %>% conf_mat(truth = type_1, estimate =.pred_class) %>%
+  autoplot(type = "heatmap")
+```
+
+
+Bug and Normal were the best and Grass and Fire were the worst. 
